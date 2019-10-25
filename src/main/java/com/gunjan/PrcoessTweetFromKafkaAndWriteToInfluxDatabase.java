@@ -1,5 +1,6 @@
 package com.gunjan;
 
+import java.sql.Timestamp;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Properties;
@@ -15,7 +16,6 @@ import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.functions.KeySelector;
-import org.apache.flink.api.java.tuple.Tuple1;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.runtime.state.filesystem.FsStateBackend;
@@ -55,7 +55,7 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
         //env.enableCheckpointing(5000);
         
         Properties properties = new Properties();
-        properties.setProperty("bootstrap.servers", "10.71.69.236:31440");
+        properties.setProperty("bootstrap.servers", "10.71.69.236:31117");
         properties.setProperty("group.id", "flink");
         
         FlinkKafkaConsumer<String> consumer = new FlinkKafkaConsumer<>("admintome-test", new SimpleStringSchema(), properties);
@@ -65,53 +65,62 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
                 .map(new MapToTweet())
                 .assignTimestampsAndWatermarks(new TimeLagWatermarkGenerator());
         
-        ProcessWindowFunction<Tuple2<String,Integer>,Tuple3<String,Integer,Long>,String,TimeWindow> processFucntion = new ProcessWindowFunction<Tuple2<String,Integer>,Tuple3<String,Integer,Long>,
-                String,TimeWindow>()
-        {
-            @Override
-            public void process(String s, Context context, Iterable<Tuple2<String,Integer>> elements, Collector<Tuple3<String,Integer,Long>> out) throws Exception
-            {
-                elements.forEach(stringIntegerLongTuple3 -> out.collect(new Tuple3<>(stringIntegerLongTuple3.f0, stringIntegerLongTuple3.f1, context.window().getEnd())));
-            }
-        };
+        ProcessWindowFunction<Tuple2<String,Long>,Tuple3<String,Long,Timestamp>,String,TimeWindow> processFucntion =
+                new ProcessWindowFunction<Tuple2<String,Long>,Tuple3<String,Long,Timestamp>,String,TimeWindow>()
+                {
+                    @Override
+                    public void process(String s, Context context, Iterable<Tuple2<String,Long>> elements, Collector<Tuple3<String,Long,Timestamp>> out) throws Exception
+                    {
+                        elements.forEach(stringIntegerLongTuple3 -> out.collect(new Tuple3<>(stringIntegerLongTuple3.f0, stringIntegerLongTuple3.f1, new Timestamp(context.window().getEnd()))));
+                    }
+                };
         tweetSingleOutputStreamOperator.flatMap(new TokenizeTweetTextFlatMap())
-                .keyBy((KeySelector<Tuple2<String,Integer>,String>)stringIntegerLongTuple3 -> stringIntegerLongTuple3.f0)
-                .timeWindow(Time.seconds(300), Time.seconds(5)).aggregate(new CustomSumAggregator(), processFucntion)
-                .timeWindowAll(Time.seconds(300), Time.seconds(5)).maxBy(1)
-                .map(new MapToInfluxDBPoint()).addSink(new InfluxDBSink(influxDBConfig));
+                .keyBy((KeySelector<Tuple2<String,Long>,String>)stringIntegerLongTuple3 -> stringIntegerLongTuple3.f0)
+                .timeWindow(Time.seconds(30), Time.seconds(5)).aggregate(new CustomSumAggregator(), processFucntion)
+                .timeWindowAll(Time.seconds(30), Time.seconds(5))
+                .maxBy(1)
+                .map(new MapToTrendingHashTagInfluxDBPoint())
+                .addSink(new InfluxDBSink(influxDBConfig));
         
         tweetSingleOutputStreamOperator
-                .map(tweet -> new Tuple1<>(1))
-                .returns(TypeInformation.of(new TypeHint<Tuple1<Integer>>()
+                .map(tweet -> 1L)
+                .returns(TypeInformation.of(new TypeHint<Long>()
                 {
                 }))
                 .windowAll(GlobalWindows.create())
-                .trigger(ContinuousEventTimeTrigger.of(Time.seconds(10)))
+                .trigger(ContinuousEventTimeTrigger.of(Time.seconds(5)))
                 .sum(0)
                 .map(new TotalTweetCountInfluxDBPoint())
                 .addSink(new InfluxDBSink(influxDBConfig));
         
         tweetSingleOutputStreamOperator
-                .map(tweet -> new Tuple2<>(1, tweet.getTimestamp_ms()))
-                .returns(TypeInformation.of(new TypeHint<Tuple2<Integer,Long>>()
-                {
-                }))
                 .timeWindowAll(Time.seconds(1))
-                .sum(0)
-                .map(new TweetPerSecondCountInfluxDBPoint())
+                .apply((AllWindowFunction<Tweet,Tuple2<Timestamp,Long>,TimeWindow>)(window, values, out) -> {
+                    long count = 0;
+                    Iterator<Tweet> iterator = values.iterator();
+                    while(iterator.hasNext())
+                    {
+                        iterator.next();
+                        count++;
+                    }
+                    
+                    out.collect(new Tuple2<>(new Timestamp(window.getEnd()), count));
+                }, TypeInformation.of(new TypeHint<Tuple2<Timestamp,Long>>()
+                {
+                })).map(new TweetPerSecondCountInfluxDBPoint())
                 .addSink(new InfluxDBSink(influxDBConfig));
         
         env.execute("Twitter Streaming Example");
     }
     
-    public static class TokenizeTweetTextFlatMap implements FlatMapFunction<Tweet,Tuple2<String,Integer>>
+    public static class TokenizeTweetTextFlatMap implements FlatMapFunction<Tweet,Tuple2<String,Long>>
     {
         private static final long serialVersionUID = 1L;
         
         private transient ObjectMapper jsonParser;
         
         @Override
-        public void flatMap(Tweet tweet, Collector<Tuple2<String,Integer>> out)
+        public void flatMap(Tweet tweet, Collector<Tuple2<String,Long>> out)
         {
             Pattern p = Pattern.compile("#\\w+");
             Matcher matcher = p.matcher(tweet.getText());
@@ -120,7 +129,7 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
                 String cleanedHashtag = matcher.group(0).trim();
                 if(cleanedHashtag != null)
                 {
-                    out.collect(new Tuple2<>(cleanedHashtag, 1));
+                    out.collect(new Tuple2<>(cleanedHashtag, 1L));
                 }
             }
         }
@@ -139,52 +148,53 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
             }
             catch(Exception e)
             {
-                // That's ok, received a malformed document
+                e.printStackTrace();
             }
             return null;
         }
     }
     
     
-    private static class MapToInfluxDBPoint extends RichMapFunction<Tuple3<String,Integer,Long>,InfluxDBPoint>
+    private static class MapToTrendingHashTagInfluxDBPoint extends RichMapFunction<Tuple3<String,Long,Timestamp>,InfluxDBPoint>
     {
         @Override
-        public InfluxDBPoint map(Tuple3<String,Integer,Long> trendingHashTag) throws Exception
+        public InfluxDBPoint map(Tuple3<String,Long,Timestamp> trendingHashTag) throws Exception
         {
             String table = "TrendingHashTag";
             HashMap<String,String> tags = new HashMap<>();
             HashMap<String,Object> fields = new HashMap<>();
             fields.put("hashtag", trendingHashTag.f0);
             fields.put("count", trendingHashTag.f1);
-            return new InfluxDBPoint(table, trendingHashTag.f2, tags, fields);
+            return new InfluxDBPoint(table, trendingHashTag.f2.getTime(), tags, fields);
         }
     }
     
-    private static class TotalTweetCountInfluxDBPoint extends RichMapFunction<Tuple1<Integer>,InfluxDBPoint>
+    private static class TotalTweetCountInfluxDBPoint implements MapFunction<Long,InfluxDBPoint>
     {
         
         @Override
-        public InfluxDBPoint map(Tuple1<Integer> totalTweetCount) throws Exception
+        public InfluxDBPoint map(Long count) throws Exception
         {
             String table = "TotalTweetCount";
             HashMap<String,String> tags = new HashMap<>();
             HashMap<String,Object> fields = new HashMap<>();
-            fields.put("count", totalTweetCount.f0);
+            fields.put("count", count);
+            // Below System.currentTimeMillis() is wrong ... need to pass trigger time of global window
             return new InfluxDBPoint(table, System.currentTimeMillis(), tags, fields);
         }
     }
     
-    private static class TweetPerSecondCountInfluxDBPoint extends RichMapFunction<Tuple2<Integer,Long>,InfluxDBPoint>
+    private static class TweetPerSecondCountInfluxDBPoint extends RichMapFunction<Tuple2<Timestamp,Long>,InfluxDBPoint>
     {
         
         @Override
-        public InfluxDBPoint map(Tuple2<Integer,Long> tweetPerSecond) throws Exception
+        public InfluxDBPoint map(Tuple2<Timestamp,Long> tweetPerSecond) throws Exception
         {
             String table = "TweetPerSecondCount";
             HashMap<String,String> tags = new HashMap<>();
             HashMap<String,Object> fields = new HashMap<>();
-            fields.put("count", tweetPerSecond.f0);
-            return new InfluxDBPoint(table, tweetPerSecond.f1, tags, fields);
+            fields.put("count", tweetPerSecond.f1);
+            return new InfluxDBPoint(table, tweetPerSecond.f0.getTime(), tags, fields);
         }
     }
     
@@ -205,7 +215,7 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
     public static class TimeLagWatermarkGenerator implements AssignerWithPeriodicWatermarks<Tweet>
     {
         
-        private final long maxTimeLag = 10000;
+        private final long maxTimeLag = 300000;
         
         @Override
         public long extractTimestamp(Tweet element, long previousElementTimestamp)
@@ -267,28 +277,28 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
         }
     }
     
-    public static class CustomSumAggregator implements AggregateFunction<Tuple2<String,Integer>,Tuple2<String,Integer>,Tuple2<String,Integer>>
+    public static class CustomSumAggregator implements AggregateFunction<Tuple2<String,Long>,Tuple2<String,Long>,Tuple2<String,Long>>
     {
         @Override
-        public Tuple2<String,Integer> createAccumulator()
+        public Tuple2<String,Long> createAccumulator()
         {
-            return new Tuple2<String,Integer>("", 0);
+            return new Tuple2<String,Long>("", 0L);
         }
         
         @Override
-        public Tuple2<String,Integer> add(Tuple2<String,Integer> stringIntegerLongTuple3, Tuple2<String,Integer> stringIntegerLongTuple32)
+        public Tuple2<String,Long> add(Tuple2<String,Long> stringIntegerLongTuple3, Tuple2<String,Long> stringIntegerLongTuple32)
         {
             return new Tuple2<>(stringIntegerLongTuple3.f0, stringIntegerLongTuple3.f1 + stringIntegerLongTuple32.f1);
         }
         
         @Override
-        public Tuple2<String,Integer> getResult(Tuple2<String,Integer> stringIntegerLongTuple3)
+        public Tuple2<String,Long> getResult(Tuple2<String,Long> stringIntegerLongTuple3)
         {
             return stringIntegerLongTuple3;
         }
         
         @Override
-        public Tuple2<String,Integer> merge(Tuple2<String,Integer> stringIntegerLongTuple3, Tuple2<String,Integer> acc1)
+        public Tuple2<String,Long> merge(Tuple2<String,Long> stringIntegerLongTuple3, Tuple2<String,Long> acc1)
         {
             return new Tuple2<>(stringIntegerLongTuple3.f0, stringIntegerLongTuple3.f1 + acc1.f1);
         }
