@@ -78,6 +78,7 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
                 .keyBy((KeySelector<Tuple2<String,Long>,String>)stringIntegerLongTuple3 -> stringIntegerLongTuple3.f0)
                 .timeWindow(Time.seconds(30), Time.seconds(5)).aggregate(new CustomSumAggregator(), processFucntion)
                 .timeWindowAll(Time.seconds(30), Time.seconds(5))
+                .trigger(ContinuousEventTimeTrigger.of(Time.seconds(5)))
                 .maxBy(1)
                 .map(new MapToTrendingHashTagInfluxDBPoint())
                 .addSink(new InfluxDBSink(influxDBConfig));
@@ -95,6 +96,7 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
         
         tweetSingleOutputStreamOperator
                 .timeWindowAll(Time.seconds(1))
+                .trigger(ContinuousEventTimeTrigger.of(Time.seconds(5)))
                 .apply((AllWindowFunction<Tweet,Tuple2<Timestamp,Long>,TimeWindow>)(window, values, out) -> {
                     long count = 0;
                     Iterator<Tweet> iterator = values.iterator();
