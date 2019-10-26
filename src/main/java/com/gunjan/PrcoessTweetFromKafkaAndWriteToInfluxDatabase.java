@@ -31,6 +31,7 @@ import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.api.windowing.assigners.GlobalWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.triggers.ContinuousEventTimeTrigger;
+import org.apache.flink.streaming.api.windowing.triggers.ContinuousProcessingTimeTrigger;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
 import org.apache.flink.util.Collector;
@@ -39,7 +40,7 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
 {
     public static void main(String[] args) throws Exception
     {
-        InfluxDBConfig influxDBConfig = InfluxDBConfig.builder("http://10.71.69.236:31948", "root", "root", "twittergraph")
+            InfluxDBConfig influxDBConfig = InfluxDBConfig.builder("http://10.71.69.236:31948", "root", "root", "twittergraph")
                 .batchActions(-1)
                 .flushDuration(100, TimeUnit.MILLISECONDS)
                 .enableGzip(true)
@@ -52,7 +53,7 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
         config.enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
         
         env.setParallelism(1);
-        //env.enableCheckpointing(5000);
+        env.enableCheckpointing(10000);
         
         Properties properties = new Properties();
         properties.setProperty("bootstrap.servers", "10.71.69.236:31117");
@@ -76,9 +77,11 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
                 };
         tweetSingleOutputStreamOperator.flatMap(new TokenizeTweetTextFlatMap())
                 .keyBy((KeySelector<Tuple2<String,Long>,String>)stringIntegerLongTuple3 -> stringIntegerLongTuple3.f0)
-                .timeWindow(Time.seconds(30), Time.seconds(5)).aggregate(new CustomSumAggregator(), processFucntion)
+                .timeWindow(Time.seconds(30), Time.seconds(5))
+                .trigger(ContinuousProcessingTimeTrigger.of(Time.seconds(5)))
+                .aggregate(new CustomSumAggregator(), processFucntion)
                 .timeWindowAll(Time.seconds(30), Time.seconds(5))
-                .trigger(ContinuousEventTimeTrigger.of(Time.seconds(5)))
+                .trigger(ContinuousProcessingTimeTrigger.of(Time.seconds(5)))
                 .maxBy(1)
                 .map(new MapToTrendingHashTagInfluxDBPoint())
                 .addSink(new InfluxDBSink(influxDBConfig));
@@ -89,14 +92,14 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
                 {
                 }))
                 .windowAll(GlobalWindows.create())
-                .trigger(ContinuousEventTimeTrigger.of(Time.seconds(5)))
+                .trigger(ContinuousProcessingTimeTrigger.of(Time.seconds(5)))
                 .sum(0)
                 .map(new TotalTweetCountInfluxDBPoint())
                 .addSink(new InfluxDBSink(influxDBConfig));
         
         tweetSingleOutputStreamOperator
                 .timeWindowAll(Time.seconds(1))
-                .trigger(ContinuousEventTimeTrigger.of(Time.seconds(5)))
+                .trigger(ContinuousProcessingTimeTrigger.of(Time.seconds(5)))
                 .apply((AllWindowFunction<Tweet,Tuple2<Timestamp,Long>,TimeWindow>)(window, values, out) -> {
                     long count = 0;
                     Iterator<Tweet> iterator = values.iterator();
