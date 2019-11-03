@@ -3,6 +3,7 @@ package com.gunjan;
 import java.sql.Timestamp;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
@@ -18,19 +19,17 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.tuple.Tuple3;
-import org.apache.flink.runtime.state.filesystem.FsStateBackend;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
-import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks;
+import org.apache.flink.streaming.api.functions.timestamps.BoundedOutOfOrdernessTimestampExtractor;
 import org.apache.flink.streaming.api.functions.windowing.AllWindowFunction;
 import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.api.windowing.assigners.GlobalWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
-import org.apache.flink.streaming.api.windowing.triggers.ContinuousEventTimeTrigger;
 import org.apache.flink.streaming.api.windowing.triggers.ContinuousProcessingTimeTrigger;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
@@ -40,7 +39,7 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
 {
     public static void main(String[] args) throws Exception
     {
-            InfluxDBConfig influxDBConfig = InfluxDBConfig.builder("http://10.71.69.236:31948", "root", "root", "twittergraph")
+        InfluxDBConfig influxDBConfig = InfluxDBConfig.builder("http://10.71.69.236:31948", "root", "root", "twittergraph")
                 .batchActions(-1)
                 .flushDuration(100, TimeUnit.MILLISECONDS)
                 .enableGzip(true)
@@ -48,23 +47,30 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
         
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
-        env.setStateBackend(new FsStateBackend("file:///data/flink/checkpoints"));
-        CheckpointConfig config = env.getCheckpointConfig();
-        config.enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
+        //env.setStateBackend(new FsStateBackend("file:///data/flink/checkpoints"));
+        //CheckpointConfig config = env.getCheckpointConfig();
+        //config.enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
         
         env.setParallelism(1);
-        env.enableCheckpointing(10000);
+        //env.enableCheckpointing(10000);
         
         Properties properties = new Properties();
-        properties.setProperty("bootstrap.servers", "10.71.69.236:31117");
+        properties.setProperty("bootstrap.servers", "10.71.69.236:31117,10.71.69.236:31118,10.71.69.236:31119");
         properties.setProperty("group.id", "flink");
         
-        FlinkKafkaConsumer<String> consumer = new FlinkKafkaConsumer<>("admintome-test", new SimpleStringSchema(), properties);
+        FlinkKafkaConsumer<String> consumer = new FlinkKafkaConsumer<>("tweeter-topic", new SimpleStringSchema(), properties);
         
         SingleOutputStreamOperator<Tweet> tweetSingleOutputStreamOperator = env
                 .addSource(consumer)
                 .map(new MapToTweet())
-                .assignTimestampsAndWatermarks(new TimeLagWatermarkGenerator());
+                .assignTimestampsAndWatermarks(new BoundedOutOfOrdernessTimestampExtractor<Tweet>(Time.seconds(300))
+                {
+                    @Override
+                    public long extractTimestamp(Tweet element)
+                    {
+                        return element.getTimestamp_ms();
+                    }
+                });
         
         ProcessWindowFunction<Tuple2<String,Long>,Tuple3<String,Long,Timestamp>,String,TimeWindow> processFucntion =
                 new ProcessWindowFunction<Tuple2<String,Long>,Tuple3<String,Long,Timestamp>,String,TimeWindow>()
@@ -75,15 +81,68 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
                         elements.forEach(stringIntegerLongTuple3 -> out.collect(new Tuple3<>(stringIntegerLongTuple3.f0, stringIntegerLongTuple3.f1, new Timestamp(context.window().getEnd()))));
                     }
                 };
+        
         tweetSingleOutputStreamOperator.flatMap(new TokenizeTweetTextFlatMap())
                 .keyBy((KeySelector<Tuple2<String,Long>,String>)stringIntegerLongTuple3 -> stringIntegerLongTuple3.f0)
                 .timeWindow(Time.seconds(30), Time.seconds(5))
                 .trigger(ContinuousProcessingTimeTrigger.of(Time.seconds(5)))
                 .aggregate(new CustomSumAggregator(), processFucntion)
-                .timeWindowAll(Time.seconds(30), Time.seconds(5))
+                .assignTimestampsAndWatermarks(new BoundedOutOfOrdernessTimestampExtractor<Tuple3<String,Long,Timestamp>>(Time.seconds(300))
+                {
+                    @Override
+                    public long extractTimestamp(Tuple3<String,Long,Timestamp> element)
+                    {
+                        return element.f2.getTime();
+                    }
+                })
+                .timeWindowAll(Time.seconds(1), Time.seconds(5))
                 .trigger(ContinuousProcessingTimeTrigger.of(Time.seconds(5)))
                 .maxBy(1)
-                .map(new MapToTrendingHashTagInfluxDBPoint())
+                .map(new MapToTrendingHashTagInfluxDBPoint2())
+                .addSink(new InfluxDBSink(influxDBConfig));
+        
+        tweetSingleOutputStreamOperator.flatMap(new TokenizeTweetTextFlatMap())
+                .timeWindowAll(Time.seconds(30), Time.seconds(5))
+                .trigger(ContinuousProcessingTimeTrigger.of(Time.seconds(5)))
+                .apply(new AllWindowFunction<Tuple2<String,Long>,Tuple3<String,Long,Timestamp>,TimeWindow>()
+                {
+                    @Override
+                    public void apply(TimeWindow window, Iterable<Tuple2<String,Long>> values, Collector<Tuple3<String,Long,Timestamp>> out) throws Exception
+                    {
+                        Map<String,Long> map = new HashMap<>();
+                        Iterator<Tuple2<String,Long>> iterator = values.iterator();
+                        while(iterator.hasNext())
+                        {
+                            Tuple2<String,Long> current = iterator.next();
+                            Long aLong = map.get(current.f0);
+                            if(aLong == null)
+                            {
+                                map.put(current.f0, current.f1);
+                            }
+                            else
+                            {
+                                map.put(current.f0, aLong + current.f1);
+                            }
+                        }
+                        
+                        
+                        Iterator<Map.Entry<String,Long>> iterator1 = map.entrySet().iterator();
+                        String currentHashTag = "";
+                        Long currentHashTagCount = 0L;
+                        
+                        while(iterator1.hasNext())
+                        {
+                            Map.Entry<String,Long> current = iterator1.next();
+                            if(current.getValue() > currentHashTagCount)
+                            {
+                                currentHashTag = current.getKey();
+                                currentHashTagCount = current.getValue();
+                            }
+                        }
+                        out.collect(new Tuple3(currentHashTag, currentHashTagCount, new Timestamp(window.getEnd())));
+                    }
+                })
+                .map(new MapToTrendingHashTagInfluxDBPoint1())
                 .addSink(new InfluxDBSink(influxDBConfig));
         
         tweetSingleOutputStreamOperator
@@ -160,12 +219,26 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
     }
     
     
-    private static class MapToTrendingHashTagInfluxDBPoint extends RichMapFunction<Tuple3<String,Long,Timestamp>,InfluxDBPoint>
+    private static class MapToTrendingHashTagInfluxDBPoint1 extends RichMapFunction<Tuple3<String,Long,Timestamp>,InfluxDBPoint>
     {
         @Override
         public InfluxDBPoint map(Tuple3<String,Long,Timestamp> trendingHashTag) throws Exception
         {
-            String table = "TrendingHashTag";
+            String table = "TrendingHashTagFlink1";
+            HashMap<String,String> tags = new HashMap<>();
+            HashMap<String,Object> fields = new HashMap<>();
+            fields.put("hashtag", trendingHashTag.f0);
+            fields.put("count", trendingHashTag.f1);
+            return new InfluxDBPoint(table, trendingHashTag.f2.getTime(), tags, fields);
+        }
+    }
+    
+    private static class MapToTrendingHashTagInfluxDBPoint2 extends RichMapFunction<Tuple3<String,Long,Timestamp>,InfluxDBPoint>
+    {
+        @Override
+        public InfluxDBPoint map(Tuple3<String,Long,Timestamp> trendingHashTag) throws Exception
+        {
+            String table = "TrendingHashTagFlink2";
             HashMap<String,String> tags = new HashMap<>();
             HashMap<String,Object> fields = new HashMap<>();
             fields.put("hashtag", trendingHashTag.f0);
@@ -180,7 +253,7 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
         @Override
         public InfluxDBPoint map(Long count) throws Exception
         {
-            String table = "TotalTweetCount";
+            String table = "TotalTweetCountFlink";
             HashMap<String,String> tags = new HashMap<>();
             HashMap<String,Object> fields = new HashMap<>();
             fields.put("count", count);
@@ -195,7 +268,7 @@ public class PrcoessTweetFromKafkaAndWriteToInfluxDatabase
         @Override
         public InfluxDBPoint map(Tuple2<Timestamp,Long> tweetPerSecond) throws Exception
         {
-            String table = "TweetPerSecondCount";
+            String table = "TweetPerSecondCountFlink";
             HashMap<String,String> tags = new HashMap<>();
             HashMap<String,Object> fields = new HashMap<>();
             fields.put("count", tweetPerSecond.f1);
